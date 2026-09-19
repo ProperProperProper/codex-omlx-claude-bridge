@@ -12,7 +12,10 @@ from claude_subscription_mcp import CLAUDE, SETTINGS, ask as ask_claude, clean_e
 from omlx_mcp import MODEL, config as omlx_config, local_response as ask_omlx
 from routing_core import Router
 
-DATABASE = Path(os.environ.get("SMART_MODELS_DB", str(Path.home() / ".local" / "share" / "smart-model-router" / "state.sqlite3"))).expanduser()
+DATABASE = Path(os.environ.get(
+    "SMART_MODELS_DB",
+    str(Path.home() / "Documents" / "Codex" / ".integrations" / "smart-model-router" / "state.sqlite3"),
+)).expanduser()
 _router = None
 
 
@@ -50,10 +53,9 @@ TOOLS = [
     {
         "name": "delegate_readonly",
         "description": (
-            "Route one bounded read-only Python coding subtask. Auto selects oMLX "
-            "for routine snippets/docs/tests, Claude Pro for deep analysis, and "
-            "Codex fallback when unavailable. Claude subscription limits trigger "
-            "cooldown and oMLX fallback. No file access or edits."
+            "Route one bounded read-only Python coding subtask. Auto is oMLX-first; "
+            "mode=deep explicitly escalates to Claude Pro, with oMLX fallback. No "
+            "file access or edits."
         ),
         "annotations": {"readOnlyHint": True, "destructiveHint": False},
         "inputSchema": {
@@ -63,6 +65,21 @@ TOOLS = [
                 "mode": {"type": "string", "enum": ["auto", "fast", "deep", "local_only"], "description": "Optional routing preference; default auto."},
                 "kind": {"type": "string", "enum": ["auto", "snippet", "docs", "tests", "explain", "architecture", "deep_review", "complex_debug", "performance", "security"], "description": "Optional Python task category; default auto."},
                 "privacy": {"type": "string", "enum": ["standard", "local_only"], "description": "Keep the prompt on the Mac when local_only; default standard."},
+            },
+            "required": ["prompt"], "additionalProperties": False,
+        },
+    },
+    {
+        "name": "routing_plan",
+        "description": "Preview the local-first routing decision, cooldown, and active capacity without invoking a model.",
+        "annotations": {"readOnlyHint": True, "destructiveHint": False},
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string", "description": "Self-contained task and context, at most 12000 characters."},
+                "mode": {"type": "string", "enum": ["auto", "fast", "deep", "local_only"]},
+                "kind": {"type": "string", "enum": ["auto", "snippet", "docs", "tests", "explain", "architecture", "deep_review", "complex_debug", "performance", "security"]},
+                "privacy": {"type": "string", "enum": ["standard", "local_only"]},
             },
             "required": ["prompt"], "additionalProperties": False,
         },
@@ -84,9 +101,9 @@ def handle(message):
             "serverInfo": {"name": "smart-model-router", "version": "1.0.0"},
             "instructions": (
                 "Codex is the OpenAI coordinator for Python coding. Use delegate_readonly "
-                "selectively for bounded independent analysis: oMLX for routine snippets, "
-                "Claude Pro for deep design/debug/review when available. Subscription limits "
-                "and outages fall back automatically. Do not delegate edits, execution, "
+                "selectively for bounded independent analysis. Auto mode is local-first: oMLX "
+                "is the control plane and Claude Pro is used only for mode=deep escalation. "
+                "Subscription limits and outages fall back automatically. Do not delegate edits, execution, "
                 "secrets, or high-stakes decisions. Verify all returned work in Codex."
             ),
         }
@@ -103,6 +120,9 @@ def handle(message):
         elif params.get("name") == "delegate_readonly":
             args = params.get("arguments") or {}
             result = router().delegate(args.get("prompt"), args.get("mode", "auto"), args.get("kind", "auto"), args.get("privacy", "standard"))
+        elif params.get("name") == "routing_plan":
+            args = params.get("arguments") or {}
+            result = router().plan(args.get("prompt"), args.get("mode", "auto"), args.get("kind", "auto"), args.get("privacy", "standard"))
         else:
             raise ValueError("Unknown tool")
         return {"content": [{"type": "text", "text": json.dumps(result)}], "isError": result.get("source") == "codex"}

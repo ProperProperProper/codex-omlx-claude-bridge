@@ -31,7 +31,7 @@ def local_response(prompt):
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=120) as response:
+        with urllib.request.urlopen(req, timeout=55) as response:
             result = json.load(response)
     except urllib.error.URLError as exc:
         if not isinstance(exc.reason, ConnectionRefusedError):

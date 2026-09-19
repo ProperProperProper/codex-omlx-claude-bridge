@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import sqlite3
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable
@@ -29,6 +30,8 @@ SIMPLE = re.compile(
 DEEP_KINDS = {"architecture", "deep_review", "complex_debug", "performance", "security"}
 KINDS = DEEP_KINDS | {"auto", "snippet", "docs", "tests", "explain"}
 MODES = {"auto", "fast", "deep", "local_only"}
+CAPACITY = {"claude": 1, "omlx": 2}
+LEASE_SECONDS = {"claude": 205, "omlx": 205}
 
 
 class Router:
@@ -48,6 +51,8 @@ class Router:
             db.execute("PRAGMA journal_mode=WAL")
             db.execute("CREATE TABLE IF NOT EXISTS providers (name TEXT PRIMARY KEY, blocked_until REAL NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, calls INTEGER NOT NULL DEFAULT 0, successes INTEGER NOT NULL DEFAULT 0, ewma_ms REAL, last_error TEXT)")
             db.execute("CREATE TABLE IF NOT EXISTS call_history (id INTEGER PRIMARY KEY, time REAL NOT NULL, provider TEXT NOT NULL, duration_ms INTEGER NOT NULL, outcome TEXT NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS leases (token TEXT PRIMARY KEY, provider TEXT NOT NULL, expires_at REAL NOT NULL)")
+            db.execute("CREATE INDEX IF NOT EXISTS leases_provider_expires ON leases(provider, expires_at)")
             for name in ("claude", "omlx"):
                 db.execute("INSERT OR IGNORE INTO providers (name) VALUES (?)", (name,))
 
@@ -64,6 +69,7 @@ class Router:
         with self._db() as db:
             rows = db.execute("SELECT name, blocked_until, failures, calls, successes, ewma_ms, last_error FROM providers").fetchall()
             recent = db.execute("SELECT provider, outcome, count(*) FROM call_history WHERE time > ? GROUP BY provider, outcome", (self.now() - 86400,)).fetchall()
+            in_flight = db.execute("SELECT provider, count(*) FROM leases WHERE expires_at > ? GROUP BY provider", (self.now(),)).fetchall()
         return {
             "providers": {
                 name: {
@@ -73,11 +79,13 @@ class Router:
                     "successes": successes,
                     "latency_ewma_ms": round(ewma) if ewma is not None else None,
                     "last_error_kind": error,
+                    "in_flight": dict(in_flight).get(name, 0),
+                    "capacity": CAPACITY[name],
                 }
                 for name, blocked, failures, calls, successes, ewma, error in rows
             },
             "last_24h": {name: {outcome: count for provider, outcome, count in recent if provider == name} for name in ("claude", "omlx")},
-            "policy": "Codex owns edits and verification; read-only Python work routes to oMLX or Claude Pro",
+            "policy": "oMLX is the local-first control plane; Claude is an explicit escalation; Codex owns edits and verification",
         }
 
     def classify(self, prompt: str, mode: str = "auto", kind: str = "auto", privacy: str = "standard"):
@@ -92,26 +100,52 @@ class Router:
             return ("claude", "explicit deep analysis", False)
         if mode == "fast":
             return ("omlx", "explicit fast response", False)
+        # Auto mode is deliberately local-first. It protects subscription capacity
+        # and makes oMLX the control plane; Claude is used only on an explicit
+        # deep escalation request.
         if kind in DEEP_KINDS or DEEP.search(prompt):
-            return ("claude", "complex Python analysis", False)
+            return ("omlx", "local-first analysis; use mode=deep to escalate", False)
         if kind in {"snippet", "docs", "tests", "explain"} or SIMPLE.search(prompt):
             return ("omlx", "bounded Python snippet or documentation", False)
-        if len(prompt) > 4500:
-            return ("claude", "large independent analysis", False)
-        if len(prompt) > 1200:
-            providers = self.status()["providers"]
-            local_ms = providers["omlx"]["latency_ewma_ms"]
-            claude_ms = providers["claude"]["latency_ewma_ms"]
-            if (local_ms and claude_ms and local_ms > 25_000
-                    and claude_ms < local_ms * 0.7
-                    and not providers["claude"]["cooldown_seconds"]):
-                return ("claude", "observed latency favors Claude for this medium task", False)
         return ("omlx", "routine bounded task", False)
 
     def _blocked(self, name):
         with self._db() as db:
             row = db.execute("SELECT blocked_until FROM providers WHERE name=?", (name,)).fetchone()
         return bool(row and row[0] > self.now())
+
+    def plan(self, prompt: str, mode: str = "auto", kind: str = "auto", privacy: str = "standard"):
+        first, reason, local_only = self.classify(prompt, mode, kind, privacy)
+        state = self.status()["providers"]
+        candidates = [first, "omlx"] if first == "claude" and not local_only else ["omlx"]
+        return {
+            "preferred": first, "reason": reason, "local_only": local_only,
+            "candidates": candidates,
+            "availability": {name: {"cooldown_seconds": state[name]["cooldown_seconds"],
+                                     "in_flight": state[name]["in_flight"],
+                                     "capacity": state[name]["capacity"]} for name in candidates},
+        }
+
+    def _reserve(self, name):
+        """Atomically enforce cooldown and capacity across MCP processes."""
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            instant = self.now()
+            db.execute("DELETE FROM leases WHERE expires_at <= ?", (instant,))
+            blocked = db.execute("SELECT blocked_until FROM providers WHERE name=?", (name,)).fetchone()
+            if blocked[0] > instant:
+                return None, "cooldown"
+            count = db.execute("SELECT count(*) FROM leases WHERE provider=?", (name,)).fetchone()[0]
+            if count >= CAPACITY[name]:
+                return None, "busy"
+            token = uuid.uuid4().hex
+            db.execute("INSERT INTO leases(token, provider, expires_at) VALUES (?, ?, ?)",
+                       (token, name, instant + LEASE_SECONDS[name]))
+            return token, None
+
+    def _release(self, token):
+        with self._db() as db:
+            db.execute("DELETE FROM leases WHERE token=?", (token,))
 
     def _record(self, name, duration_ms, error=None):
         with self._db() as db:
@@ -144,8 +178,9 @@ class Router:
         order = [first, "omlx"] if first == "claude" and not local_only else ["omlx"]
         failures = []
         for name in order:
-            if self._blocked(name):
-                failures.append(f"{name}: temporarily unavailable ({self.status()['providers'][name]['last_error_kind']})")
+            token, unavailable = self._reserve(name)
+            if unavailable:
+                failures.append(f"{name}: {unavailable}")
                 continue
             started = time.monotonic()
             try:
@@ -158,4 +193,6 @@ class Router:
                 # Only report a bounded error category; never store prompts or output.
                 self._record(name, (time.monotonic() - started) * 1000, str(exc))
                 failures.append(f"{name}: {self.status()['providers'][name]['last_error_kind']}")
+            finally:
+                self._release(token)
         return {"source": "codex", "answer": "Handle this subtask in Codex; external models are unavailable.", "routing_reason": reason, "fallback": failures}

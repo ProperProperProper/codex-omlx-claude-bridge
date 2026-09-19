@@ -1,8 +1,22 @@
 # Codex + oMLX + Claude Pro bridge
 
-A Python stdio MCP bridge for bounded, **read-only** coding subtasks in the Codex desktop app. Codex remains the OpenAI coordinator: it reads the repository, edits files, runs tests, and checks results. `smart_models.delegate_readonly` routes small Python functions, docstrings, type hints, and test ideas to a local oMLX model; deeper design, concurrency, performance, and subtle bug analysis go to Claude Code using an active Claude Pro/Max **subscription login**. A Claude usage-limit response triggers a SQLite-backed cooldown and fallback to oMLX. If both providers are unavailable, the tool returns control to Codex.
+A Python stdio MCP bridge for bounded, **read-only** coding subtasks in the Codex desktop app. oMLX is the free, local-first control plane: every automatic routing decision sends routine and complex Python analysis to the local model. Claude Code is an explicit escalation path using an active Claude Pro/Max **subscription login** when `mode="deep"` is selected. Codex reads the repository, edits files, runs tests, and checks results. A Claude usage-limit response triggers a SQLite-backed cooldown and fallback to oMLX. If both providers are unavailable, the tool returns control to Codex.
 
 This is task-level delegation, not a replacement for the Codex main model or a way to share a single inference across three providers. Model suggestions have no filesystem access through this bridge and require Codex review. The router uses heuristics and observed latency; it cannot read subscription quota ahead of time or guarantee a particular provider's quality.
+
+## Continuity when a session ends
+
+The bridge automatically falls back from a Claude subscription-limit response to oMLX during a running request. A Codex or Claude session that has already ended cannot launch another tool call: the desktop apps do not expose a subscription-exhaustion callback or a portable quota API. The bridge therefore cannot truthfully promise invisible automatic continuation after an app has stopped.
+
+`continuity.py` is the independent continuation entry point. It shares the same SQLite state and local-first policy, so a shell wrapper, launcher, or a user can continue a bounded task without a live Codex MCP connection:
+
+```sh
+python3 /absolute/path/to/repo/continuity.py 'Draft Python tests for this function: ...'
+python3 /absolute/path/to/repo/continuity.py --plan 'Review this asyncio design: ...'
+python3 /absolute/path/to/repo/continuity.py --mode deep 'Give a second opinion on this race condition: ...'
+```
+
+The first two commands remain on oMLX. `--mode deep` is a deliberate Claude escalation and falls back to oMLX if Claude is unavailable or limited. The command returns JSON and never edits files. A separate scheduler may invoke it, but it must supply the task text; the bridge does not scrape conversations or access repositories on its own.
 
 ## Requirements
 
@@ -46,9 +60,9 @@ For consistent use in coding tasks, add [the example policy](AGENTS.example.md) 
 
 ## Routing and state
 
-`delegate_readonly` takes a self-contained `prompt` (up to 12,000 characters), optional `kind` (`snippet`, `docs`, `tests`, `explain`, `architecture`, `deep_review`, `complex_debug`, `performance`, `security`, or `auto`), `mode` (`auto`, `fast`, `deep`, `local_only`), and `privacy` (`standard` or `local_only`). `fast` prefers oMLX; `deep` prefers Claude and falls back to oMLX; `local_only` never calls Claude. Sensitive-looking text is routed locally, though callers should avoid passing secrets entirely. Local-first failures return control to Codex without consuming Claude capacity. Deep Claude quota failures fall back to oMLX.
+`delegate_readonly` takes a self-contained `prompt` (up to 12,000 characters), optional `kind` (`snippet`, `docs`, `tests`, `explain`, `architecture`, `deep_review`, `complex_debug`, `performance`, `security`, or `auto`), `mode` (`auto`, `fast`, `deep`, `local_only`), and `privacy` (`standard` or `local_only`). `auto` and `fast` always use oMLX; even deep task kinds stay local in auto mode. `deep` is the deliberate Claude escalation and falls back to oMLX. `local_only` never calls Claude. Sensitive-looking text is routed locally, though callers should avoid passing secrets entirely. Local-first failures return control to Codex without consuming Claude capacity. Deep Claude quota failures fall back to oMLX.
 
-`routing_status` reports counters, last-day outcomes, latency estimates, and cooldown. Set `probe=true` to check Claude subscription auth, the oMLX endpoint, and whether the configured model directory exists without making an inference call. An oMLX connection refusal attempts to start its managed server once before retrying. Claude limit failures back off for one hour, then progressively longer up to six hours on repeated failures; this is **not** the exact reset time. After cooldown, a deep task retries Claude automatically.
+`routing_plan` previews the local-first decision, cooldown, and capacity without invoking a model. `routing_status` reports counters, last-day outcomes, latency estimates, active work, and cooldown. SQLite leases make capacity limits atomic across MCP processes: one Claude escalation and two local requests may run at once. Expired leases are reclaimed after a process crash. Set `probe=true` to check Claude subscription auth, the oMLX endpoint, and whether the configured model directory exists without making an inference call. An oMLX connection refusal attempts to start its managed server once before retrying. Claude limit failures back off for one hour, then progressively longer up to six hours on repeated failures; this is **not** the exact reset time. After cooldown, a deep task retries Claude automatically.
 
 SQLite uses WAL and atomic writes to share state between MCP processes. It stores provider names, counts, timings, bounded outcome categories, and cooldowns with up to 5,000 history rows. It does **not** store prompts, answers, credentials, or repository content. Keep the database outside Git; `.gitignore` excludes common local state. The service still passes the bounded prompt to its selected provider, so use `privacy="local_only"` or avoid delegation for sensitive work.
 
@@ -60,8 +74,9 @@ If Claude reports an API-key source, remove any API-key overrides from its *loca
 
 ## Files
 
-- `smart_model_router_mcp.py`: stdio JSON-RPC MCP endpoint with `delegate_readonly` and `routing_status`.
-- `routing_core.py`: task classification, SQLite metrics and cooldown, provider fallback.
+- `smart_model_router_mcp.py`: stdio JSON-RPC MCP endpoint with `delegate_readonly`, `routing_plan`, and `routing_status`.
+- `continuity.py`: independent, read-only local-first entry point for continuing bounded work outside an MCP request.
+- `routing_core.py`: local-first routing policy, atomic SQLite capacity leases, metrics, cooldown, and provider fallback.
 - `claude_subscription_mcp.py`: subscription-only Claude Code invocation and optional direct MCP tool.
 - `omlx_mcp.py`: local Responses client, managed-server recovery, optional direct MCP tool.
 - `tests/`: billing guard, routing, privacy, quota, persistence, and local recovery tests.
