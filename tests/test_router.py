@@ -49,6 +49,19 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(reason, "busy")
         self.router._release(one)
 
+    def test_local_capacity_and_expired_lease_recovery(self):
+        first, _ = self.router._reserve("omlx")
+        second, _ = self.router._reserve("omlx")
+        third, reason = self.router._reserve("omlx")
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertIsNone(third)
+        self.assertEqual(reason, "busy")
+        self.time += 206
+        recovered, reason = self.router._reserve("omlx")
+        self.assertIsNotNone(recovered)
+        self.assertIsNone(reason)
+
     def test_quota_circuit_shared_and_recovery(self):
         def limited(_):
             self.calls.append("claude")
