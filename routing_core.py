@@ -47,18 +47,29 @@ class Router:
         self.omlx = omlx
         self.now = now
         self.database.parent.mkdir(parents=True, exist_ok=True)
-        with self._db() as db:
-            db.execute("PRAGMA journal_mode=WAL")
-            db.execute("CREATE TABLE IF NOT EXISTS providers (name TEXT PRIMARY KEY, blocked_until REAL NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, calls INTEGER NOT NULL DEFAULT 0, successes INTEGER NOT NULL DEFAULT 0, ewma_ms REAL, last_error TEXT)")
-            db.execute("CREATE TABLE IF NOT EXISTS call_history (id INTEGER PRIMARY KEY, time REAL NOT NULL, provider TEXT NOT NULL, duration_ms INTEGER NOT NULL, outcome TEXT NOT NULL)")
-            db.execute("CREATE TABLE IF NOT EXISTS leases (token TEXT PRIMARY KEY, provider TEXT NOT NULL, expires_at REAL NOT NULL)")
-            db.execute("CREATE INDEX IF NOT EXISTS leases_provider_expires ON leases(provider, expires_at)")
-            for name in ("claude", "omlx"):
-                db.execute("INSERT OR IGNORE INTO providers (name) VALUES (?)", (name,))
+        self._initialize()
+
+    def _initialize(self):
+        """Create shared state safely when several MCP processes start together."""
+        for attempt in range(5):
+            try:
+                with self._db() as db:
+                    db.execute("PRAGMA journal_mode=WAL")
+                    db.execute("CREATE TABLE IF NOT EXISTS providers (name TEXT PRIMARY KEY, blocked_until REAL NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, calls INTEGER NOT NULL DEFAULT 0, successes INTEGER NOT NULL DEFAULT 0, ewma_ms REAL, last_error TEXT)")
+                    db.execute("CREATE TABLE IF NOT EXISTS call_history (id INTEGER PRIMARY KEY, time REAL NOT NULL, provider TEXT NOT NULL, duration_ms INTEGER NOT NULL, outcome TEXT NOT NULL)")
+                    db.execute("CREATE TABLE IF NOT EXISTS leases (token TEXT PRIMARY KEY, provider TEXT NOT NULL, expires_at REAL NOT NULL)")
+                    db.execute("CREATE INDEX IF NOT EXISTS leases_provider_expires ON leases(provider, expires_at)")
+                    for name in ("claude", "omlx"):
+                        db.execute("INSERT OR IGNORE INTO providers (name) VALUES (?)", (name,))
+                return
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt == 4:
+                    raise
+                time.sleep(0.05 * (2 ** attempt))
 
     @contextmanager
     def _db(self):
-        db = sqlite3.connect(self.database, timeout=5)
+        db = sqlite3.connect(self.database, timeout=10)
         try:
             with db:
                 yield db

@@ -2,6 +2,7 @@ import json
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -61,6 +62,22 @@ class RouterTests(unittest.TestCase):
         recovered, reason = self.router._reserve("omlx")
         self.assertIsNotNone(recovered)
         self.assertIsNone(reason)
+
+    def test_concurrent_router_startup_shares_database(self):
+        errors = []
+
+        def start_router():
+            try:
+                Router(self.database, self.claude, self.omlx, lambda: self.time)
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=start_router) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
 
     def test_quota_circuit_shared_and_recovery(self):
         def limited(_):
